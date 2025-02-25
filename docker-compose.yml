@@ -1,0 +1,15 @@
+version: "3.7.0"
+
+services: 
+  parser:
+    build: 
+      context: . 
+      dockerfile: Dockerfile
+    ports:
+      - 8000:8000
+    restart: on-failure
+    volumes:
+      - ./data:/app/data
+      - ./src:/app/src
+    command: sh -c "cargo watch -x run"
+
