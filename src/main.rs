@@ -1,17 +1,18 @@
 mod structure;
 
 use futures::{stream, StreamExt};
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use reqwest;
+use std::sync::Mutex;
 use std::error::Error;
 use std::fs::File;
 use csv::ReaderBuilder;
 use futures::future::join_all;
 use std::time::{Duration, Instant};
 use std::sync::Arc;
-use tokio_postgres::{Client, NoTls, Error as DbError};
+use tokio_postgres::NoTls;
 use fxhash::FxHashSet;
+use deadpool_postgres::{Manager, Pool, ManagerConfig, RecyclingMethod};
 
 use crate::structure::Root;
 use crate::structure::Record;
@@ -20,26 +21,31 @@ use crate::structure::ConcurrentQueue;
 const PAGE_LIMIT: u16 = 50;
 const MAX_RETRIES: u8 = 5;
 const RETRY_DELAY: Duration = Duration::from_millis(500);
-const CHUNK_SISE: usize = 50;
-const END_INDEX:usize = 1000000;
+const CHUNK_SISE: usize = 80;
 
-async fn create_connect_to_db() -> Result<Client, DbError>{
-    log::info!("Connecting to database...");
-    let (client, connection) = tokio_postgres::connect(
-        "host=localhost port=5433 user=admin password=password dbname=internal_db",
-        NoTls, 
-    ).await.map_err(|e| {
-        log::error!("Database connection error: {}", e);
-        e
-    })?;
+async fn create_pool() -> Result<Pool, Box<dyn Error>> {
+    log::info!("Creating database pool...");
+    let mut pg_config = tokio_postgres::Config::new();
+    pg_config.host("localhost");
+    pg_config.port(5433);
+    pg_config.user("admin");
+    pg_config.password("password");
+    pg_config.dbname("internal_db");
     
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            log::error!("Connection error: {}", e);
-        }
-    });
-    log::info!("Successfully connected to database");
-    Ok(client)
+    let mgr_config = ManagerConfig {
+        recycling_method: RecyclingMethod::Fast,
+    };
+    let mgr = Manager::from_config(pg_config, NoTls, mgr_config);
+    let pool = Pool::builder(mgr)
+        .max_size(16)
+        .build()
+        .map_err(|e| {
+            log::error!("Failed to create pool: {}", e);
+            e
+        })?;
+    
+    log::info!("Database pool created successfully");
+    Ok(pool)
 }
 
 async fn fetch_url(word: &str, page: u16) -> Result<String, reqwest::Error> {
@@ -73,7 +79,7 @@ async fn get_ids(word: &str, page: u16) -> Vec<u64>{
                         break;
                     }
                     Err(e) => {
-                        log::warn!("JSON parsing error for '{}' page {}: {}\nResponse body: {}", word, page, e, body);
+                        // log::warn!("JSON parsing error for '{}' page {}: {}\nResponse body: {}", word, page, e, body);
                         break;
                     }
                 }
@@ -134,7 +140,7 @@ async fn fetch_all_products(word: &str) -> Result<(Vec<u64>, &str), Box<dyn std:
 async fn go_on_all_words(start_index: usize, queue: Arc<ConcurrentQueue>) -> Result<(), Box<dyn Error>> {
     log::info!("Starting processing words from index {}", start_index);
     let data = read_first_column_structured("requests.csv")?;
-    let total_items = std::cmp::min(data.len(), END_INDEX);
+    let total_items = data.len();
     log::info!("Total words to process: {}", total_items);
     
     let counter = Arc::new(AtomicUsize::new(start_index));
@@ -174,12 +180,14 @@ async fn go_on_all_words(start_index: usize, queue: Arc<ConcurrentQueue>) -> Res
     Ok(())
 }
 
-async fn check_and_send_to_db(queue: Arc<ConcurrentQueue>, client: Client) {
-    log::info!("Starting database writer");
-    let mut send_data: Vec<(u64, u64)> = Vec::new();
-    let mut total_inserted = 0;
-    
-    log::debug!("Loading existing pairs from database");
+async fn create_hash_set(pool: Pool) -> Mutex<FxHashSet<(u64, u64)>>{
+    let client = match pool.get().await {
+        Ok(client) => client,
+        Err(e) => {
+            log::error!("Failed to get database connection: {}", e);
+            return Mutex::new(FxHashSet::default());
+        }
+    };
     let rows = client.query(
         "SELECT keyword_id, product_id FROM keyword_product",
         &[],
@@ -188,13 +196,31 @@ async fn check_and_send_to_db(queue: Arc<ConcurrentQueue>, client: Client) {
     for row in rows {
         let keyword_id: i64 = row.get(0);
         let product_id: i64 = row.get(1);
-        
         pairs.insert((
-            keyword_id.try_into().expect("Ошибка конвертации keyword_id"),
-            product_id.try_into().expect("Ошибка конвертации product_id"),
+            keyword_id as u64,
+            product_id as u64,
         ));
     }
+    drop(client);
+    Mutex::new(pairs)
 
+}
+
+async fn check_and_send_to_db(queue: Arc<ConcurrentQueue>, pool: Pool, pairs: Arc<Mutex<FxHashSet<(u64, u64)>>>) {
+    log::info!("Starting database writer");
+    let mut send_data: Vec<(u64, u64)> = Vec::new();
+    let mut total_inserted = 0;
+    
+    log::debug!("Loading existing pairs from database");
+    let client = match pool.get().await {
+        Ok(client) => client,
+        Err(e) => {
+            log::error!("Failed to get database connection: {}", e);
+            return;
+        }
+    };
+    drop(client);
+    
     log::info!("Starting main processing loop");
     
     loop {
@@ -202,6 +228,13 @@ async fn check_and_send_to_db(queue: Arc<ConcurrentQueue>, client: Client) {
         log::debug!("Received {} products for '{}'", data.len(), identifier);
         
         let insert_start = Instant::now();
+        let client = match pool.get().await {
+            Ok(client) => client,
+            Err(e) => {
+                log::error!("Failed to get database connection: {}", e);
+                continue;
+            }
+        };
         let row = match client.query_one(
             "INSERT INTO keywords (keyword_text) 
              VALUES ($1) 
@@ -231,7 +264,7 @@ async fn check_and_send_to_db(queue: Arc<ConcurrentQueue>, client: Client) {
                 continue;
             },
         };
-        
+        let mut pairs = pairs.lock().unwrap();
         let new_items = data.iter()
             .filter(|&element| pairs.insert((index, *element)))
             .count();
@@ -248,6 +281,13 @@ async fn check_and_send_to_db(queue: Arc<ConcurrentQueue>, client: Client) {
                 .map(|(k, p)| (*k as i64, *p as i64))
                 .unzip();
 
+            let client = match pool.get().await {
+                Ok(client) => client,
+                Err(e) => {
+                    log::error!("Failed to get database connection: {}", e);
+                    continue;
+                }
+            };
             match client.execute(
                 "INSERT INTO public.keyword_product (keyword_id, product_id)
                 SELECT * FROM UNNEST($1::bigint[], $2::bigint[])
@@ -271,6 +311,7 @@ async fn check_and_send_to_db(queue: Arc<ConcurrentQueue>, client: Client) {
         }
     }
 }
+
 
 fn read_first_column_structured(path: &str) -> Result<Vec<String>, Box<dyn Error>> {
     log::info!("Reading CSV file: {}", path);
@@ -319,7 +360,9 @@ async fn main() -> Result<(), Box<dyn Error>>{
     setup_logger().unwrap();
     log::info!("Start app");
     let queue = Arc::new(ConcurrentQueue::new());
-    let client = create_connect_to_db().await?;
+    let pool = create_pool().await?;
+
+    let client = pool.get().await?;
 
     let rows = client.query(
         "SELECT max(keyword_id) FROM public.keywords;",&[]
@@ -340,15 +383,43 @@ async fn main() -> Result<(), Box<dyn Error>>{
             }
         });
     });
+    println!("rofl");
+    let pairs = Arc::new(create_hash_set(pool.clone()).await);
+    println!("end read");
 
-    let consumer_queue = Arc::clone(&queue);
-    let consumer =  std::thread::spawn(move || {
+    let consumer_pairs_1 = Arc::clone(&pairs);
+    let consumer_queue_1 = Arc::clone(&queue);
+    let consumer_pool_1 = pool.clone();
+    let consumer_1 =  std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            check_and_send_to_db(consumer_queue, client).await;
+            check_and_send_to_db(consumer_queue_1, consumer_pool_1, consumer_pairs_1).await;
         });
     });
+
+    let consumer_pairs_2 = Arc::clone(&pairs);
+    let consumer_queue_2 = Arc::clone(&queue);
+    let consumer_pool_2 = pool.clone();
+    let consumer_2 =  std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            check_and_send_to_db(consumer_queue_2, consumer_pool_2, consumer_pairs_2).await;
+        });
+    });
+
+    let consumer_pairs_3 = Arc::clone(&pairs);
+    let consumer_queue_3 = Arc::clone(&queue);
+    let consumer_pool_3 = pool.clone();
+    let consumer_3 =  std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            check_and_send_to_db(consumer_queue_3, consumer_pool_3, consumer_pairs_3).await;
+        });
+    });
+
     producer.join().unwrap();
-    consumer.join().unwrap();
+    consumer_1.join().unwrap();
+    consumer_2.join().unwrap();
+    consumer_3.join().unwrap();
     Ok(())
 }

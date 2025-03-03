@@ -172,7 +172,7 @@ impl ConcurrentQueue {
         self.condvar.notify_one(); 
     }
 
-    pub fn pop(&self) -> Option<(Vec<u64>, String)> {
+    pub fn _pop(&self) -> Option<(Vec<u64>, String)> {
         let mut queue = self.queue.lock().unwrap();
         queue.pop()
     }
