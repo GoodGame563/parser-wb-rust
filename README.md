@@ -56,7 +56,3 @@ The parser-wb service collects product data from the Wildberries marketplace, pr
 ## Development Notes
 - Rust, reqwest, deadpool-postgres
 - See thesis for scraping logic, concurrency, and data flow
-- Refer to `README.alt1.md` and original README for more details
-
----
-This is a highly detailed README for thesis documentation. Do not overwrite the original README if present.
